@@ -1,0 +1,223 @@
+"""
+Created on Sun Aug 10 08:58:13 2025
+
+@author: salvador
+OpenAI was used to tailor and upgrade this code
+
+Levey-Jennings Control Chart with Regression and Category Analysis
+
+This script:
+- Loads reactor control limit (CL) data
+- Generates Levey-Jennings charts with regression lines
+- Computes delta metrics and ratios per reactor
+- Produces summary visualizations (bar plots, heatmaps, etc.)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import matplotlib as mpl
+
+# Plot configuration
+mpl.rcParams["legend.fontsize"] = "x-large"
+mpl.rcParams["legend.title_fontsize"] = "x-large"
+mpl.rcParams["legend.frameon"] = True
+mpl.rcParams["legend.edgecolor"] = "black"
+mpl.rcParams["legend.framealpha"] = 1.0
+mpl.rcParams["legend.fancybox"] = False
+mpl.rcParams['figure.dpi'] = 600
+mpl.rcParams['savefig.dpi'] = 600
+
+# === Load your CSV data ===
+# Replace this with your own file path
+file_path = "your_data.csv"  # <--- Replace with your CSV path
+df = pd.read_csv(file_path)
+
+structures = df.sample(frac=1).reset_index(drop=True)  # Shuffle rows
+reactor_order = sorted(structures["Reactor"].unique(), key=lambda x: int(x.split("_")[1]))
+
+structures_types = [
+    ("Structure_A", "Mean"),
+    ("Structure_A", "Sigma"),
+    ("Structure_B", "Mean"),
+    ("Structure_B", "Sigma")
+]
+
+exclude_reactor = "Reactor_1" # <-- Change this check for other reactor or specific category
+all_regression_stats = []
+
+def levey_jennings_plot(subset, structure, type_, 
+                        exclude_reactor=None, y_min=None, 
+                        y_max=None, 
+                        ytick_step=None, 
+                        reg_linewidth=2.0, 
+                        n_last_points=25): # <-- Change this to tune sensitivity of the latest point linear regression
+    global all_regression_stats
+    subset_stats = subset if exclude_reactor is None else subset[subset["Reactor"] != exclude_reactor]
+
+    mean_cl = subset_stats["CL"].mean()
+    std_cl = subset_stats["CL"].std()
+
+    lines = {
+        "+1σ": mean_cl + std_cl,
+        "-1σ": mean_cl - std_cl,
+        "+2σ": mean_cl + 2 * std_cl,
+        "-2σ": mean_cl - 2 * std_cl,
+        "+3σ": mean_cl + 3 * std_cl,
+        "-3σ": mean_cl - 3 * std_cl
+    }
+
+    control_colors = {"+1σ": "gray", "-1σ": "gray", "+2σ": "orange", "-2σ": "orange", "+3σ": "red", "-3σ": "red"}
+
+    subset["Reactor"] = pd.Categorical(subset["Reactor"], categories=reactor_order, ordered=True)
+
+    plt.figure(figsize=(12, 6))
+    sns.set(style="whitegrid")
+    palette = sns.color_palette("tab10", len(reactor_order))
+    color_map = dict(zip(reactor_order, palette))
+
+    sns.scatterplot(
+        data=subset,
+        x="Total Runs",
+        y="CL",
+        hue="Reactor",
+        palette=color_map,
+        hue_order=reactor_order,
+        alpha=0.7,
+        edgecolor="black",
+        s=60,
+        legend=True
+    )
+
+    regression_results = []
+
+    for reactor in reactor_order:
+        reactor_data = subset[subset["Reactor"] == reactor].sort_values("Total Runs")
+        if reactor_data.shape[0] < 2:
+            continue
+
+        x_all = reactor_data["Total Runs"]
+        y_all = reactor_data["CL"]
+        slope_all, intercept_all = np.polyfit(x_all, y_all, deg=1)
+        line_all = np.poly1d((slope_all, intercept_all))
+
+        lastn_data = reactor_data.tail(n_last_points)
+        x_last = lastn_data["Total Runs"]
+        y_last = lastn_data["CL"]
+        slope_lastn, intercept_lastn = np.polyfit(x_last, y_last, deg=1) if len(x_last) >= 2 else (np.nan, np.nan)
+
+        color = color_map.get(reactor, "black")
+        x_vals_all = np.linspace(x_all.min(), x_all.max(), 100)
+        plt.plot(x_vals_all, line_all(x_vals_all), color=color, linewidth=reg_linewidth)
+
+        if not np.isnan(slope_lastn):
+            x_vals_lastn = np.linspace(x_last.min(), x_last.max(), 100)
+            plt.plot(x_vals_lastn, slope_lastn * x_vals_lastn + intercept_lastn, color=color, linewidth=reg_linewidth, linestyle='--', alpha=0.8)
+
+        regression_results.append({
+            "Structure": structure,
+            "Type": type_,
+            "Reactor": reactor,
+            "Slope_All": slope_all,
+            "Intercept_All": intercept_all,
+            f"Slope_Last{n_last_points}": slope_lastn,
+            f"Intercept_Last{n_last_points}": intercept_lastn
+        })
+
+    for label, y in lines.items():
+        plt.axhline(y, linestyle='--', color=control_colors.get(label, 'black'), label=label)
+
+    if y_min is None or y_max is None:
+        all_lines = list(lines.values())
+        min_line = min(all_lines)
+        max_line = max(all_lines)
+        margin = 0.05 * (max_line - min_line)
+        y_min = min(subset["CL"].min(), min_line) - margin
+        y_max = max(subset["CL"].max(), max_line) + margin
+
+    if ytick_step is None:
+        ytick_step = 0.05 if type_ == "Sigma" else 0.1
+
+    yticks = np.arange(np.floor(y_min / ytick_step) * ytick_step, np.ceil(y_max / ytick_step) * ytick_step + ytick_step, ytick_step)
+
+    plt.yticks(yticks)
+    plt.ylim(y_min, y_max)
+    plt.xlabel("Total Runs", fontsize=18)
+    plt.ylabel(f"{type_}", fontsize=18)
+    plt.tick_params(axis='both', labelsize=14)
+    plt.legend(title="Reactor / Fit / Threshold", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+    all_regression_stats.extend(regression_results)
+
+# === Run all Levey-Jennings plots ===
+for structure, type_ in structures_types:
+    subset = structures[(structures["Structure"] == structure) & (structures["Type"] == type_)]
+    if not subset.empty:
+        levey_jennings_plot(subset, structure, type_, exclude_reactor=exclude_reactor)
+
+df_regression = pd.DataFrame(all_regression_stats)
+
+# === Compute summary statistics ===
+cl_summary = structures.groupby(["Structure", "Type", "Reactor"], as_index=False).agg(
+    CL_Mean=("CL", "mean"),
+    CL_Std=("CL", "std")
+)
+
+for sigma in [1, 2, 3]:
+    cl_summary[f"+{sigma}σ"] = cl_summary["CL_Mean"] + sigma * cl_summary["CL_Std"]
+    cl_summary[f"-{sigma}σ"] = cl_summary["CL_Mean"] - sigma * cl_summary["CL_Std"]
+
+df_merged = pd.merge(df_regression, cl_summary, on=["Structure", "Type", "Reactor"], how="left")
+df_merged["Delta_Regression"] = df_merged["Slope_All"] - (df_merged["CL_Mean"] - df_merged["Intercept_All"])
+
+# === Compute group-level metrics ===
+grouped = df_merged.groupby(["Structure", "Type", "Reactor"])["Delta_Regression"] \
+                   .apply(lambda x: x.abs().mean()) \
+                   .reset_index(name="Avg_Abs_Delta_Regression")
+
+category_avg = grouped[grouped["Reactor"] != exclude_reactor] \
+    .groupby(["Structure", "Type"])["Avg_Abs_Delta_Regression"] \
+    .mean() \
+    .reset_index(name="Category_Avg_Abs_Delta")
+
+grouped = pd.merge(grouped, category_avg, on=["Structure", "Type"], how="left")
+grouped["Ratio_to_Category_Avg"] = grouped["Avg_Abs_Delta_Regression"] / grouped["Category_Avg_Abs_Delta"]
+
+# === Visualizations ===
+grouped["Structure_Type"] = grouped["Structure"] + " " + grouped["Type"]
+
+plt.figure(figsize=(14, 7))
+sns.barplot(data=grouped, x="Reactor", y="Ratio_to_Category_Avg", hue="Structure_Type", ci=True)
+plt.axhline(1, color='red', linestyle='--', label="Category Avg (Ratio=1)")
+plt.title("Ratio of Avg Absolute Delta by Reactor")
+plt.ylabel("Ratio to Category Avg")
+plt.xlabel("Reactor")
+plt.xticks(rotation=45)
+plt.legend(title="Structure")
+plt.tight_layout()
+plt.show()
+
+# Heatmap
+pivot_table = grouped.pivot_table(index=["Structure", "Type"], columns="Reactor", values="Ratio_to_Category_Avg")
+plt.figure(figsize=(12, 6))
+sns.heatmap(pivot_table, annot=True, cmap="coolwarm", center=1)
+plt.title("Heatmap of Ratio to Category Avg Absolute Delta")
+plt.xlabel("Reactor")
+plt.ylabel("Structure and Type")
+plt.tight_layout()
+plt.show()
+
+# Scatter plot
+plt.figure(figsize=(14, 6))
+sns.scatterplot(data=grouped, x="Reactor", y="Ratio_to_Category_Avg", hue="Structure", style="Type", s=100)
+plt.axhline(1, color='gray', linestyle='--')
+plt.title("Scatter of Ratio to Category Avg Absolute Delta by Reactor")
+plt.ylabel("Ratio to Category Avg")
+plt.xlabel("Reactor")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
