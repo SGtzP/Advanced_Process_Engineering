@@ -1,0 +1,166 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+
+# === CONFIGURATION ===
+BATTERY_ID = 18
+DATE_FROM = "2014-01"
+DATE_TO = "2014-06"
+RECENT_POINTS = 2000
+SEEDS = range(1, 11)
+
+# === DATA PATH ===
+DATA_PATH = os.path.join("data", "Small_df", f"Bat{BATTERY_ID}")
+
+# === COLUMNS ===
+COLUMNS = [
+    "I_Batt", "SOC_Batt",
+    "U_Cell_1", "U_Cell_2", "U_Cell_3", "U_Cell_4",
+    "U_Cell_5", "U_Cell_6", "U_Cell_7", "U_Cell_8",
+    "T_Cell_1_2", "T_Cell_3_4", "T_Cell_5_6", "T_Cell_7_8"
+]
+VOLTAGE_COLS = [col for col in COLUMNS if col.startswith("U_Cell")]
+
+# === HELPER FUNCTIONS ===
+def load_battery_data(path: str, seeds, battery_id: int) -> pd.DataFrame:
+    """Load and combine battery data for multiple seeds."""
+    dfs = []
+    for seed in seeds:
+        file_path = os.path.join(path, f"df_bat{battery_id}_small_{seed}.pkl")
+        if not os.path.exists(file_path):
+            print(f"Warning: Missing file {file_path}")
+            continue
+
+        df = pd.read_pickle(file_path)
+        if "Timestamp" not in df.columns:
+            df = df.reset_index()
+
+        df["file_id"] = seed
+        dfs.append(df)
+
+    if not dfs:
+        raise ValueError(f"No data found for BATTERY_ID={battery_id}")
+
+    combined_df = pd.concat(dfs, ignore_index=True)
+    combined_df.drop_duplicates(subset="Timestamp", inplace=True)
+    combined_df["Timestamp"] = pd.to_datetime(combined_df["Timestamp"])
+    return combined_df
+
+
+def filter_by_date(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    """Filter dataframe by date range."""
+    df = df[(df["Timestamp"] >= pd.to_datetime(start)) &
+            (df["Timestamp"] <= pd.to_datetime(end))]
+    if df.empty:
+        raise ValueError("No data in the selected date range.")
+    return df
+
+
+def normalize_voltages_by_temperature(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize voltages by associated temperature sensors."""
+    R = 8.314  # J/mol·K
+    voltage_temp_map = {
+        "U_Cell_1": "T_Cell_1_2", "U_Cell_2": "T_Cell_1_2",
+        "U_Cell_3": "T_Cell_3_4", "U_Cell_4": "T_Cell_3_4",
+        "U_Cell_5": "T_Cell_5_6", "U_Cell_6": "T_Cell_5_6",
+        "U_Cell_7": "T_Cell_7_8", "U_Cell_8": "T_Cell_7_8",
+    }
+
+    normalized_cols = []
+    for v_col, t_col in voltage_temp_map.items():
+        if v_col in df.columns and t_col in df.columns:
+            T_K = df[t_col] + 273.15
+            norm_col = f"{v_col}_norm"
+            df[norm_col] = 1000 * df[v_col] / (R * T_K)  # scaled for readability
+            normalized_cols.append(norm_col)
+    return df, normalized_cols
+
+
+def add_state_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Add charging/discharging state labels."""
+    df['I_State'] = df['I_Batt'].apply(lambda x: 'Charging' if x >= 0 else 'Discharging')
+    return df
+
+
+def categorize_soc(df: pd.DataFrame) -> pd.DataFrame:
+    """Bin State of Charge (SoC) into categories."""
+    bins = np.arange(0, 110, 10)
+    labels = [f"{i}-{i+10}" for i in range(0, 100, 10)]
+    df['SoC_cat'] = pd.cut(df['SOC_Batt'], bins=bins, labels=labels, include_lowest=True)
+    return df
+
+
+def plot_dynamic_spc_by_state_normalized(df: pd.DataFrame, cols: list[str], title_suffix: str = "", ylabel: str = "Normalized Voltage") -> None:
+    """Plot SPC chart with regression trend and sloped SPC limits, separately for Charging and Discharging, using normalized voltages."""
+    df = df.copy()
+    df["combined_value"] = df[cols].mean(axis=1)
+
+    scatter_colors = {'Charging': 'orange', 'Discharging': 'tab:orange'}
+    trend_colors   = {'Charging': 'navy', 'Discharging': 'darkred'}
+
+    for state in ['Charging', 'Discharging']:
+        state_df = df[df['I_State'] == state]
+        if state_df.empty:
+            continue
+
+        plt.figure(figsize=(14, 6))
+
+        for col in cols:
+            if col in state_df.columns:
+                plt.scatter(state_df["Timestamp"], state_df[col], s=6, alpha=0.25,
+                            color=scatter_colors[state],
+                            label=col if col == cols[0] else None)
+
+        x_days = (state_df["Timestamp"] - state_df["Timestamp"].min()).dt.days.values.reshape(-1, 1)
+        y = state_df["combined_value"].values
+
+        if len(x_days) > 1:
+            model = LinearRegression().fit(x_days, y)
+            x_fit = np.linspace(x_days.min(), x_days.max(), 300).reshape(-1, 1)
+            y_fit = model.predict(x_fit)
+            t_fit = state_df["Timestamp"].min() + pd.to_timedelta(x_fit.flatten(), unit="D")
+
+            plt.plot(t_fit, y_fit,
+                     color=trend_colors[state], linewidth=2.5, alpha=0.9,
+                     label=f"{state} trend")
+
+            y_pred = model.predict(x_days)
+            residuals = y - y_pred
+            sigma = np.std(residuals)
+
+            for i, color in zip([1, 2, 3], ["orange", "purple", "red"]):
+                plt.plot(t_fit, y_fit + i * sigma, linestyle="--", color=color, label=f"+{i}σ")
+                plt.plot(t_fit, y_fit - i * sigma, linestyle="--", color=color, label=f"-{i}σ")
+
+        plt.title(f"SPC (Dynamic Rails): {title_suffix} - {state}", fontsize=16)
+        plt.xlabel("Timestamp", fontsize=16)
+        plt.ylabel(ylabel, fontsize=16)
+        plt.legend(ncol=3, fontsize=12)
+        plt.xticks(fontsize=14)
+        plt.yticks(fontsize=14)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+
+# === MAIN PIPELINE ===
+if __name__ == "__main__":
+    try:
+        combined_df = load_battery_data(DATA_PATH, SEEDS, BATTERY_ID)
+        combined_df = filter_by_date(combined_df, DATE_FROM, DATE_TO)
+        combined_df = add_state_labels(combined_df)
+        combined_df, norm_voltage_cols = normalize_voltages_by_temperature(combined_df)
+        combined_df = categorize_soc(combined_df)
+
+        print("SPC Plot (Normalized Voltages - Dynamic, by State):")
+        plot_dynamic_spc_by_state_normalized(
+            combined_df,
+            norm_voltage_cols,
+            title_suffix="Normalized Voltages",
+            ylabel="Normalized Voltage (×10³ U/RT) [mol/C]"
+        )
+
+    except Exception as e:
+        print(f"Error in main pipeline: {e}")
